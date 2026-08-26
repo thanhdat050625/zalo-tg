@@ -93,6 +93,34 @@ async function initTurso(): Promise<void> {
           }
           console.log(`[Turso] Restored ${_pollByZaloId.size} polls from Turso`);
         } catch { /* ignore */ }
+      } else if (key === 'msg_map' && _zaloToTg.size === 0) {
+        try {
+          const raw = JSON.parse(dataStr) as MsgMapFile;
+          const parsed = _parseMsgMapRaw(raw);
+          for (const [zaloId, tgId] of parsed.pairs) {
+            if (!_zaloToTg.has(zaloId)) {
+              _msgKeyOrder.push(zaloId);
+              _tgRefCount.set(tgId, (_tgRefCount.get(tgId) ?? 0) + 1);
+            }
+            _zaloToTg.set(zaloId, tgId);
+          }
+          for (const [tgId, quote] of parsed.quotes) {
+            _tgToQuote.set(tgId, quote);
+          }
+          console.log(`[Turso] Restored ${_zaloToTg.size} msg mappings & ${_tgToQuote.size} quotes from Turso`);
+        } catch { /* ignore */ }
+      } else if (key === 'sent_msg' && _sentMap.size === 0) {
+        try {
+          const parsed = JSON.parse(dataStr) as { entries: [number, SentMsgInfo][] };
+          for (const [tgId, info] of parsed.entries ?? []) {
+            _sentMap.set(tgId, info);
+            _sentKeyOrder.push(tgId);
+            for (const mid of info.msgIds) {
+              _sentByZaloId.set(String(mid), tgId);
+            }
+          }
+          console.log(`[Turso] Restored ${_sentMap.size} sent messages from Turso`);
+        } catch { /* ignore */ }
       }
     }
 
@@ -322,6 +350,35 @@ interface MsgMapData {
 
 const _msgMapFile = path.resolve(config.dataDir, 'msg-map.json');
 
+function _parseMsgMapRaw(raw: MsgMapFile): MsgMapData {
+  // v2 compact format
+  if ('v' in raw && raw.v === 2) {
+    const { s, p, q } = raw;
+    // Filter out sentinel "0" / empty pairs (came from undefined realMsgId)
+    const pairs = p.filter(([k]) => k && k !== '0');
+    const quotes: [number, ZaloQuoteData][] = q.map(
+      ([tgId, msgId, cliMsgId, uidIdx, ts, typeIdx, content, ttl, zaloIdx, threadType]) => [
+        tgId,
+        {
+          msgId,
+          cliMsgId,
+          uidFrom:    s[uidIdx]!,
+          ts,
+          msgType:    s[typeIdx]!,
+          content,
+          ttl,
+          zaloId:     s[zaloIdx]!,
+          threadType,
+        } satisfies ZaloQuoteData,
+      ],
+    );
+    return { pairs, quotes };
+  }
+  // v1 legacy format — also filter zeros
+  const v1 = raw as MsgMapData;
+  return { pairs: v1.pairs.filter(([k]) => k && k !== '0'), quotes: v1.quotes };
+}
+
 function _loadMsgMap(): MsgMapData {
   if (!existsSync(_msgMapFile)) return { pairs: [], quotes: [] };
   try {
@@ -329,32 +386,7 @@ function _loadMsgMap(): MsgMapData {
     // Detect gzip by magic bytes 0x1F 0x8B
     if (buf[0] === 0x1F && buf[1] === 0x8B) buf = gunzipSync(buf);
     const raw = JSON.parse(buf.toString('utf8')) as MsgMapFile;
-    // v2 compact format
-    if ('v' in raw && raw.v === 2) {
-      const { s, p, q } = raw;
-      // Filter out sentinel "0" / empty pairs (came from undefined realMsgId)
-      const pairs = p.filter(([k]) => k && k !== '0');
-      const quotes: [number, ZaloQuoteData][] = q.map(
-        ([tgId, msgId, cliMsgId, uidIdx, ts, typeIdx, content, ttl, zaloIdx, threadType]) => [
-          tgId,
-          {
-            msgId,
-            cliMsgId,
-            uidFrom:    s[uidIdx]!,
-            ts,
-            msgType:    s[typeIdx]!,
-            content,
-            ttl,
-            zaloId:     s[zaloIdx]!,
-            threadType,
-          } satisfies ZaloQuoteData,
-        ],
-      );
-      return { pairs, quotes };
-    }
-    // v1 legacy format — also filter zeros
-    const v1 = raw as MsgMapData;
-    return { pairs: v1.pairs.filter(([k]) => k && k !== '0'), quotes: v1.quotes };
+    return _parseMsgMapRaw(raw);
   } catch { return { pairs: [], quotes: [] }; }
 }
 
@@ -891,6 +923,44 @@ const SENT_MAP_MAX = 5000;
 /** zaloId values currently being sent by the bot (to handle echo race condition) */
 const _pendingSendConvos = new Map<string, { count: number; markedAt: number }>();
 
+const _sentMsgFile = path.resolve(config.dataDir, 'sent-msg.json');
+
+let _sentMsgPersistTimer: ReturnType<typeof setTimeout> | null = null;
+function _scheduleSentMsgPersist(): void {
+  if (_sentMsgPersistTimer) return;
+  _sentMsgPersistTimer = setTimeout(() => {
+    _sentMsgPersistTimer = null;
+    try {
+      if (!existsSync(config.dataDir)) mkdirSync(config.dataDir, { recursive: true });
+      const entries = Array.from(_sentMap.entries());
+      const _tmp = _sentMsgFile + '.tmp';
+      writeFileSync(_tmp, gzipSync(JSON.stringify({ entries }), { level: 9 }));
+      renameSync(_tmp, _sentMsgFile);
+      syncToTurso('sent_msg', { entries });
+    } catch (e) {
+      console.warn('[sentMsgStore] Failed to persist sent-msg:', e);
+    }
+  }, 1000);
+}
+
+function _loadSentMsg(): void {
+  if (!existsSync(_sentMsgFile)) return;
+  try {
+    let buf = readFileSync(_sentMsgFile);
+    if (buf[0] === 0x1F && buf[1] === 0x8B) buf = gunzipSync(buf);
+    const parsed = JSON.parse(buf.toString('utf8')) as { entries: [number, SentMsgInfo][] };
+    for (const [tgId, info] of parsed.entries ?? []) {
+      _sentMap.set(tgId, info);
+      _sentKeyOrder.push(tgId);
+      for (const mid of info.msgIds) {
+        _sentByZaloId.set(String(mid), tgId);
+      }
+    }
+  } catch { /* ignore */ }
+}
+
+_loadSentMsg();
+
 export const sentMsgStore = {
   /** Record a message we sent from TG→Zalo. tgMsgId is the user's TG message. */
   save(tgMsgId: number, info: SentMsgInfo): void {
@@ -919,6 +989,7 @@ export const sentMsgStore = {
     for (const mid of info.msgIds) {
       _sentByZaloId.set(String(mid), tgMsgId);
     }
+    _scheduleSentMsgPersist();
   },
 
   get(tgMsgId: number): SentMsgInfo | undefined {
