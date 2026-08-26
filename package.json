@@ -4,17 +4,18 @@
   "description": "Zalo ↔ Telegram bridge using Forum Topics",
   "type": "module",
   "scripts": {
-    "dev": "NODE_OPTIONS=--disable-warning=DEP0205 tsx src/index.ts",
-    "dev:watch": "NODE_OPTIONS=--disable-warning=DEP0205 node --watch --import tsx src/index.ts",
+    "dev": "node --disable-warning=DEP0205 --import tsx src/index.ts",
+    "dev:watch": "node --disable-warning=DEP0205 --watch --import tsx src/index.ts",
     "build": "tsc",
     "tui:build": "go build -o bin/zalo-tg-tui ./cmd/zalo-tg-tui && GOBIN=$PWD/bin go install github.com/charmbracelet/glow@v1.5.1",
     "start": "node --disable-warning=DEP0205 dist/index.js",
-    "test": "NODE_OPTIONS=--disable-warning=DEP0205 tsx --test tests/*.test.ts",
+    "test": "node --disable-warning=DEP0205 --import tsx --test tests/*.test.ts",
     "check": "npm run build && npm test",
     "test:coverage": "node --disable-warning=DEP0205 --import tsx --test --experimental-test-coverage tests/*.test.ts",
     "security:audit": "npm audit --omit=dev"
   },
   "dependencies": {
+    "@libsql/client": "^0.17.4",
     "@napi-rs/canvas": "^1.0.1",
     "adm-zip": "^0.5.17",
     "axios": "^1.7.2",

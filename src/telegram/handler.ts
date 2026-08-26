@@ -596,11 +596,43 @@ export function setupTelegramHandler(
       return;
     }
 
+    if (arg === 'clean' || arg === 'prune' || arg === 'deepclean' || arg === 'purge') {
+      await ctx.telegram.sendMessage(
+        config.telegram.groupId,
+        '🧹 Đang quét toàn diện nhóm Zalo & Telegram để làm sạch tất cả topic thừa / trùng lặp...',
+        replyOpts,
+      );
+      const { reconcileAndCleanTopics } = await import('../index.js');
+      const result = await reconcileAndCleanTopics(currentApi);
+      const totalRemoved = result.removedFromStore.length + result.deletedOrphanTgTopics.length;
+      if (totalRemoved === 0) {
+        await ctx.telegram.sendMessage(
+          config.telegram.groupId,
+          `✅ Tất cả <b>${result.totalChecked}</b> topic hiện tại đều đồng bộ và hợp lệ (không có topic thừa nào).`,
+          { ...replyOpts, parse_mode: 'HTML' },
+        );
+      } else {
+        const details: string[] = [];
+        if (result.removedFromStore.length > 0) {
+          details.push(`• Nhóm Zalo đã rời: <b>${result.removedFromStore.length}</b> topic`);
+        }
+        if (result.deletedOrphanTgTopics.length > 0) {
+          details.push(`• Topic mồ côi/trùng lặp cũ trên Telegram: <b>${result.deletedOrphanTgTopics.length}</b> topic (ID: <code>${result.deletedOrphanTgTopics.join(', ')}</code>)`);
+        }
+        await ctx.telegram.sendMessage(
+          config.telegram.groupId,
+          `🧹 <b>Đã dọn dẹp sạch sẽ tổng cộng ${totalRemoved} topic:</b>\n${details.join('\n')}\n\n<i>(Đã xoá vĩnh viễn khỏi Telegram & database)</i>`,
+          { ...replyOpts, parse_mode: 'HTML' },
+        );
+      }
+      return;
+    }
+
     if (!topicId) {
       await ctx.telegram.sendMessage(
         config.telegram.groupId,
-        '⚠️ Lệnh này phải được gửi trong một topic cụ thể.',
-        replyOpts,
+        '⚠️ Lệnh này phải được gửi trong một topic cụ thể (hoặc dùng <code>/topic clean</code> từ General).',
+        { ...replyOpts, parse_mode: 'HTML' },
       );
       return;
     }
@@ -625,17 +657,20 @@ export function setupTelegramHandler(
         await ctx.telegram.sendMessage(config.telegram.groupId, '❌ Topic này chưa được map.', replyOpts);
         return;
       }
+      try {
+        await ctx.telegram.deleteForumTopic(config.telegram.groupId, topicId);
+      } catch { /* ignore if already deleted */ }
       await ctx.telegram.sendMessage(
         config.telegram.groupId,
-        `🗑️ Đã xoá mapping: <b>${removed.name}</b> (zaloId=${removed.zaloId})`,
-        { ...replyOpts, parse_mode: 'HTML' },
-      );
+        `🗑️ Đã xoá vĩnh viễn topic và mapping: <b>${removed.name}</b> (zaloId=${removed.zaloId})`,
+        { parse_mode: 'HTML' },
+      ).catch(() => undefined);
       return;
     }
 
     await ctx.telegram.sendMessage(
       config.telegram.groupId,
-      '❓ Dùng: <code>/topic list</code> | <code>/topic info</code> | <code>/topic delete</code>',
+      '❓ Dùng: <code>/topic list</code> | <code>/topic clean</code> | <code>/topic info</code> | <code>/topic delete</code>',
       { ...replyOpts, parse_mode: 'HTML' },
     );
   });

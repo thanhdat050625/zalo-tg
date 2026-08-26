@@ -1,7 +1,111 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync } from 'fs';
 import { gzipSync, gunzipSync } from 'zlib';
 import path from 'path';
+import { createClient, type Client } from '@libsql/client';
 import { config } from './config.js';
+
+// ── Turso DB Sync (Optional Cloud Persistence) ────────────────────────────────
+const tursoUrl = process.env.TURSO_DATABASE_URL?.trim();
+const tursoAuthToken = process.env.TURSO_AUTH_TOKEN?.trim();
+
+let _tursoClient: Client | null = null;
+if (tursoUrl) {
+  try {
+    _tursoClient = createClient({
+      url: tursoUrl,
+      authToken: tursoAuthToken || undefined,
+    });
+  } catch (err) {
+    console.warn('[Turso] Failed to initialize client:', err);
+  }
+}
+
+function syncToTurso(key: string, dataObj: unknown): void {
+  if (!_tursoClient) return;
+  const dataStr = typeof dataObj === 'string' ? dataObj : JSON.stringify(dataObj);
+  _tursoClient.execute({
+    sql: 'INSERT INTO zalo_storage (key, data, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET data = excluded.data, updated_at = excluded.updated_at',
+    args: [key, dataStr, Date.now()],
+  }).catch((err: unknown) => {
+    console.warn(`[Turso] Sync error for "${key}":`, err);
+  });
+}
+
+async function initTurso(): Promise<void> {
+  if (!_tursoClient) return;
+  try {
+    await _tursoClient.execute(`
+      CREATE TABLE IF NOT EXISTS zalo_storage (
+        key TEXT PRIMARY KEY,
+        data TEXT,
+        updated_at INTEGER
+      )
+    `);
+    console.log('[Turso] Database connected and table zalo_storage initialized');
+
+    const res = await _tursoClient.execute('SELECT key, data FROM zalo_storage');
+    for (const row of res.rows) {
+      const key = String(row.key);
+      const dataStr = String(row.data);
+
+      if (key === 'topics') {
+        try {
+          const parsed = JSON.parse(dataStr) as StoreData;
+          if (parsed && typeof parsed.topics === 'object') {
+            let changed = false;
+            for (const [tId, entry] of Object.entries(parsed.topics)) {
+              if (!_data.topics[tId]) {
+                _data.topics[tId] = entry;
+                _data.zaloIndex[`${entry.type}:${entry.zaloId}`] = entry.topicId;
+                changed = true;
+              }
+            }
+            if (changed) {
+              persist(_data);
+              console.log(`[Turso] Restored ${Object.keys(parsed.topics).length} topic mapping(s) from Turso`);
+            }
+          }
+        } catch { /* ignore parse error */ }
+      } else if (key === 'user_cache' && _uidToName.size === 0) {
+        try {
+          const parsed = JSON.parse(dataStr) as UserCacheDisk;
+          for (const [uid, name] of Object.entries(parsed.u ?? {})) {
+            _uidToName.set(uid, name);
+            _normToUid.set(_normName(name), uid);
+          }
+          for (const [gid, members] of Object.entries(parsed.g ?? {})) {
+            const m = new Map<string, string>();
+            for (const [norm, uid] of Object.entries(members)) m.set(norm, uid);
+            _groupNameToUid.set(gid, m);
+          }
+          for (const [gid, members] of Object.entries(parsed.gn ?? {})) {
+            _groupUidToName.set(gid, new Map(Object.entries(members)));
+          }
+          console.log(`[Turso] Restored ${_uidToName.size} user cache entries from Turso`);
+        } catch { /* ignore */ }
+      } else if (key === 'polls' && _pollByZaloId.size === 0) {
+        try {
+          const parsed = JSON.parse(dataStr) as { entries: PollEntry[] };
+          for (const entry of parsed.entries ?? []) {
+            _pollByZaloId.set(entry.pollId, entry);
+            _pollByTgId.set(entry.tgPollMsgId, entry);
+            _pollByUUID.set(entry.tgPollUUID, entry);
+          }
+          console.log(`[Turso] Restored ${_pollByZaloId.size} polls from Turso`);
+        } catch { /* ignore */ }
+      }
+    }
+
+    // If local has topics but Turso doesn't yet, sync local topics up
+    if (Object.keys(_data.topics).length > 0) {
+      syncToTurso('topics', _data);
+    }
+  } catch (err) {
+    console.warn('[Turso] Init/sync error:', err);
+  }
+}
+
+void initTurso();
 
 /**
  * Track Zalo message IDs recently recalled from Telegram side.
@@ -78,6 +182,7 @@ function persist(data: StoreData): void {
   const tmpPath = filePath + '.tmp';
   writeFileSync(tmpPath, JSON.stringify(data, null, 2), 'utf8');
   renameSync(tmpPath, filePath);
+  syncToTurso('topics', data);
 }
 
 function zaloKey(zaloId: string, type: 0 | 1): string {
@@ -297,6 +402,7 @@ function _scheduleMsgPersist(): void {
       const _tmpMsg = _msgMapFile + '.tmp';
       writeFileSync(_tmpMsg, gzipSync(JSON.stringify(data), { level: 9 }));
       renameSync(_tmpMsg, _msgMapFile);
+      syncToTurso('msg_map', data);
     } catch (e) {
       console.warn('[msgStore] Failed to persist msg-map:', e);
     }
@@ -520,6 +626,7 @@ function _scheduleUserCachePersist(): void {
       const _tmpUser = _userCacheFile + '.tmp';
       writeFileSync(_tmpUser, gzipSync(JSON.stringify(disk), { level: 9 }));
       renameSync(_tmpUser, _userCacheFile);
+      syncToTurso('user_cache', disk);
     } catch (e) {
       console.warn('[userCache] Failed to persist:', e);
     }
@@ -1248,6 +1355,7 @@ function _schedulePollPersist(): void {
       const tmp = _pollFile + '.tmp';
       writeFileSync(tmp, gzipSync(JSON.stringify({ entries }), { level: 9 }));
       renameSync(tmp, _pollFile);
+      syncToTurso('polls', { entries });
     } catch (e) {
       console.warn('[pollStore] Failed to persist:', e);
     }

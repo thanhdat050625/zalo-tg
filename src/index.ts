@@ -24,25 +24,83 @@ let _reconnectInProgress = false;
 let _reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 let _activeZaloApi: Awaited<ReturnType<typeof getZaloApi>> | null = null;
 let _bridgeReadyAnnounced = false;
+let _topicCleanupInterval: ReturnType<typeof setInterval> | null = null;
 
 // ── Boot Zalo (also used when /login swaps in a fresh API) ───────────────────
 
-async function pruneLeftGroupTopics(api: Awaited<ReturnType<typeof getZaloApi>>): Promise<void> {
+/**
+ * Unified Topic Cleaner:
+ * 1. Checks all mapped group topics against active Zalo groups (prunes groups you left).
+ * 2. Scans Telegram forum topics and deletes any orphan / duplicate topics not in store.
+ * Runs automatically on boot, every 1 hour, and when /topic clean is called.
+ */
+export async function reconcileAndCleanTopics(
+  api?: Awaited<ReturnType<typeof getZaloApi>> | null,
+): Promise<{ removedFromStore: string[]; deletedOrphanTgTopics: number[]; totalChecked: number }> {
+  const removedFromStore: string[] = [];
+  const deletedOrphanTgTopics: number[] = [];
+  const allTopics = store.all();
+
   try {
-    const groups = await api.getAllGroups() as { gridVerMap?: Record<string, string> } | undefined;
-    const activeGroupIds = new Set(Object.keys(groups?.gridVerMap ?? {}));
-    const removed: string[] = [];
-    for (const entry of store.all()) {
-      if (entry.type === 1 && !activeGroupIds.has(entry.zaloId)) {
-        store.remove(entry.topicId);
-        removed.push(`${entry.name} (${entry.zaloId})`);
+    // 1. Check active Zalo groups (if Zalo API is connected)
+    if (api) {
+      const groups = await api.getAllGroups().catch(() => undefined) as { gridVerMap?: Record<string, string> } | undefined;
+      const activeGroupIds = new Set(Object.keys(groups?.gridVerMap ?? {}));
+
+      for (const entry of allTopics) {
+        if (entry.type === 1 && !activeGroupIds.has(entry.zaloId)) {
+          try {
+            await tgBot.telegram.deleteForumTopic(config.telegram.groupId, entry.topicId);
+          } catch (tgErr) {
+            const msg = (tgErr as Error)?.message ?? String(tgErr);
+            if (!msg.includes('TOPIC_ID_INVALID') && !msg.includes('message thread not found')) {
+              console.warn(`[TopicCleaner] Delete Telegram topic ${entry.topicId} (${entry.name}):`, msg);
+            }
+          }
+          store.remove(entry.topicId);
+          removedFromStore.push(`Nhóm: "${entry.name}" (${entry.zaloId})`);
+        }
       }
     }
-    if (removed.length > 0) {
-      terminal.status('topics', `pruned ${removed.length} stale mapping(s)`, 'warn');
+
+    // 2. Scan and purge orphan / duplicate topics from Telegram that are not in store
+    const allKnownTopicIds = new Set(store.all().map(e => e.topicId));
+    const highestStoreId = Math.max(0, ...Array.from(allKnownTopicIds));
+    const scanLimit = Math.max(highestStoreId + 30, 300);
+
+    for (let id = 2; id <= scanLimit; id++) {
+      if (allKnownTopicIds.has(id)) continue;
+
+      try {
+        await tgBot.telegram.deleteForumTopic(config.telegram.groupId, id);
+        deletedOrphanTgTopics.push(id);
+        console.log(`[TopicCleaner] Deleted orphan Telegram topic #${id}`);
+        await new Promise(r => setTimeout(r, 80));
+      } catch {
+        // Not a topic or already deleted -> skip quietly
+      }
     }
+
+    const totalCleaned = removedFromStore.length + deletedOrphanTgTopics.length;
+    if (totalCleaned > 0) {
+      terminal.status('topics', `cleaned ${totalCleaned} stale/orphan topic(s)`, 'warn');
+      console.log(`[TopicCleaner] Cleaned ${removedFromStore.length} stale group(s) and ${deletedOrphanTgTopics.length} orphan Telegram topic(s).`);
+    } else {
+      console.log(`[TopicCleaner] Periodic scan complete: all ${allTopics.length} topic(s) valid & in sync.`);
+    }
+
+    return {
+      removedFromStore,
+      deletedOrphanTgTopics,
+      totalChecked: allTopics.length,
+    };
   } catch (err) {
-    console.warn('[Boot] Could not prune stale group topics:', err);
+    console.warn('[TopicCleaner] Error during topic scan & clean:', err);
+    return {
+      removedFromStore,
+      deletedOrphanTgTopics,
+      totalChecked: allTopics.length,
+    };
   }
 }
 
@@ -51,7 +109,17 @@ async function startZalo(
   isReconnect = false,
 ): Promise<void> {
   _activeZaloApi = api;
-  if (!isReconnect) void pruneLeftGroupTopics(api);
+  if (!isReconnect) void reconcileAndCleanTopics(api);
+
+  // Setup periodic 1-hour topic scan and cleanup
+  if (!_topicCleanupInterval) {
+    _topicCleanupInterval = setInterval(() => {
+      if (_activeZaloApi) {
+        void reconcileAndCleanTopics(_activeZaloApi);
+      }
+    }, 60 * 60 * 1000); // 1 hour
+  }
+
   await setupZaloHandler(api);
   if (isReconnect) {
     api.listener.once('connected', () => {
@@ -165,7 +233,7 @@ async function main(): Promise<void> {
     { command: 'joingroup',      description: 'Tham gia nhóm Zalo qua link' },
     { command: 'leavegroup',     description: 'Rời nhóm Zalo & đóng topic (dùng trong topic nhóm)' },
     { command: 'friendrequests', description: 'Xem lời mời kết bạn & lời mời nhóm' },
-    { command: 'topic',          description: 'Quản lý topic: list / info / delete' },
+    { command: 'topic',          description: 'Quản lý topic: list / clean / info / delete' },
     { command: 'history',        description: 'Nạp lịch sử chat nhóm vào topic (dùng trong topic nhóm)' },
     { command: 'autoreply',      description: 'Tự trả lời DM khi offline: on / off / status' },
     { command: 'recall',         description: 'Thu hồi tin nhắn (reply vào tin đã gửi)' },
@@ -184,6 +252,10 @@ async function main(): Promise<void> {
     if (_reconnectTimer) {
       clearTimeout(_reconnectTimer);
       _reconnectTimer = null;
+    }
+    if (_topicCleanupInterval) {
+      clearInterval(_topicCleanupInterval);
+      _topicCleanupInterval = null;
     }
     try { _activeZaloApi?.listener.stop(); } catch { /* ignore */ }
     try { await tgBot.stop(reason); } catch { /* bot may not have launched yet */ }
