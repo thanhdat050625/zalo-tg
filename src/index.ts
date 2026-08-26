@@ -1,3 +1,4 @@
+import http from 'http';
 import { getZaloApi, resetZaloApi } from './zalo/client.js';
 import { CloseReason, ThreadType } from 'zca-js';
 import { setupZaloHandler } from './zalo/handler.js';
@@ -8,6 +9,8 @@ import { startUpdateChecker } from './updater.js';
 import { store, userCache } from './store.js';
 import { registerShutdownHandler, requestShutdown } from './lifecycle.js';
 import { terminal } from './utils/terminal.js';
+
+const _bridgeStartTime = Date.now();
 
 // ── Global safety net — prevent unhandled rejections from crashing ────────────
 process.on('unhandledRejection', (reason) => {
@@ -301,6 +304,26 @@ async function main(): Promise<void> {
   });
 
   terminal.status('bridge', 'starting services…', 'info');
+
+  // ── Lightweight HTTP health-check server (for Render / Koyeb / Docker port binding) ──
+  const port = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
+  try {
+    const server = http.createServer((_req, res) => {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        status: 'ok',
+        service: 'zalo-tg-bridge',
+        uptime: Math.floor((Date.now() - _bridgeStartTime) / 1000),
+        zalo: _activeZaloApi ? 'connected' : 'waiting_auth',
+        telegram: 'connected',
+      }));
+    });
+    server.listen(port, '0.0.0.0', () => {
+      terminal.status('http', `health check listening on port ${port}`, 'success');
+    });
+  } catch (httpErr) {
+    console.warn('[Boot] Could not start HTTP server:', httpErr);
+  }
 
   process.once('SIGINT',  () => { void requestShutdown('Received SIGINT', 0); });
   process.once('SIGTERM', () => { void requestShutdown('Received SIGTERM', 0); });
