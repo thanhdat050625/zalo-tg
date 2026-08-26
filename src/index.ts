@@ -34,14 +34,13 @@ let _topicCleanupInterval: ReturnType<typeof setInterval> | null = null;
 /**
  * Unified Topic Cleaner:
  * 1. Checks all mapped group topics against active Zalo groups (prunes groups you left).
- * 2. Scans Telegram forum topics and deletes any orphan / duplicate topics not in store.
+ * 2. Removes stale mappings from store and deletes their corresponding Telegram topics.
  * Runs automatically on boot, every 1 hour, and when /topic clean is called.
  */
 export async function reconcileAndCleanTopics(
   api?: Awaited<ReturnType<typeof getZaloApi>> | null,
-): Promise<{ removedFromStore: string[]; deletedOrphanTgTopics: number[]; totalChecked: number }> {
+): Promise<{ removedFromStore: string[]; totalChecked: number }> {
   const removedFromStore: string[] = [];
-  const deletedOrphanTgTopics: number[] = [];
   const allTopics = store.all();
 
   try {
@@ -66,42 +65,21 @@ export async function reconcileAndCleanTopics(
       }
     }
 
-    // 2. Scan and purge orphan / duplicate topics from Telegram that are not in store
-    const allKnownTopicIds = new Set(store.all().map(e => e.topicId));
-    const highestStoreId = Math.max(0, ...Array.from(allKnownTopicIds));
-    const scanLimit = Math.max(highestStoreId + 30, 300);
-
-    for (let id = 2; id <= scanLimit; id++) {
-      if (allKnownTopicIds.has(id)) continue;
-
-      try {
-        await tgBot.telegram.deleteForumTopic(config.telegram.groupId, id);
-        deletedOrphanTgTopics.push(id);
-        console.log(`[TopicCleaner] Deleted orphan Telegram topic #${id}`);
-        await new Promise(r => setTimeout(r, 80));
-      } catch {
-        // Not a topic or already deleted -> skip quietly
-      }
-    }
-
-    const totalCleaned = removedFromStore.length + deletedOrphanTgTopics.length;
-    if (totalCleaned > 0) {
-      terminal.status('topics', `cleaned ${totalCleaned} stale/orphan topic(s)`, 'warn');
-      console.log(`[TopicCleaner] Cleaned ${removedFromStore.length} stale group(s) and ${deletedOrphanTgTopics.length} orphan Telegram topic(s).`);
+    if (removedFromStore.length > 0) {
+      terminal.status('topics', `cleaned ${removedFromStore.length} stale topic(s)`, 'warn');
+      console.log(`[TopicCleaner] Cleaned ${removedFromStore.length} stale group topic(s):\n - ${removedFromStore.join('\n - ')}`);
     } else {
       console.log(`[TopicCleaner] Periodic scan complete: all ${allTopics.length} topic(s) valid & in sync.`);
     }
 
     return {
       removedFromStore,
-      deletedOrphanTgTopics,
       totalChecked: allTopics.length,
     };
   } catch (err) {
     console.warn('[TopicCleaner] Error during topic scan & clean:', err);
     return {
       removedFromStore,
-      deletedOrphanTgTopics,
       totalChecked: allTopics.length,
     };
   }

@@ -597,31 +597,28 @@ export function setupTelegramHandler(
     }
 
     if (arg === 'clean' || arg === 'prune' || arg === 'deepclean' || arg === 'purge') {
+      if (!currentApi) {
+        await ctx.telegram.sendMessage(config.telegram.groupId, '❌ Zalo chưa kết nối.', replyOpts);
+        return;
+      }
       await ctx.telegram.sendMessage(
         config.telegram.groupId,
-        '🧹 Đang quét toàn diện nhóm Zalo & Telegram để làm sạch tất cả topic thừa / trùng lặp...',
+        '🧹 Đang quét danh sách nhóm Zalo và dọn dẹp topic không còn hoạt động...',
         replyOpts,
       );
       const { reconcileAndCleanTopics } = await import('../index.js');
       const result = await reconcileAndCleanTopics(currentApi);
-      const totalRemoved = result.removedFromStore.length + result.deletedOrphanTgTopics.length;
-      if (totalRemoved === 0) {
+      if (result.removedFromStore.length === 0) {
         await ctx.telegram.sendMessage(
           config.telegram.groupId,
           `✅ Tất cả <b>${result.totalChecked}</b> topic hiện tại đều đồng bộ và hợp lệ (không có topic thừa nào).`,
           { ...replyOpts, parse_mode: 'HTML' },
         );
       } else {
-        const details: string[] = [];
-        if (result.removedFromStore.length > 0) {
-          details.push(`• Nhóm Zalo đã rời: <b>${result.removedFromStore.length}</b> topic`);
-        }
-        if (result.deletedOrphanTgTopics.length > 0) {
-          details.push(`• Topic mồ côi/trùng lặp cũ trên Telegram: <b>${result.deletedOrphanTgTopics.length}</b> topic (ID: <code>${result.deletedOrphanTgTopics.join(', ')}</code>)`);
-        }
+        const list = result.removedFromStore.map(r => `• ${escapeHtml(r)}`).join('\n');
         await ctx.telegram.sendMessage(
           config.telegram.groupId,
-          `🧹 <b>Đã dọn dẹp sạch sẽ tổng cộng ${totalRemoved} topic:</b>\n${details.join('\n')}\n\n<i>(Đã xoá vĩnh viễn khỏi Telegram & database)</i>`,
+          `🧹 <b>Đã dọn dẹp ${result.removedFromStore.length} topic nhóm Zalo đã rời:</b>\n${list}\n\n<i>(Đã xoá vĩnh viễn khỏi Telegram & database)</i>`,
           { ...replyOpts, parse_mode: 'HTML' },
         );
       }
